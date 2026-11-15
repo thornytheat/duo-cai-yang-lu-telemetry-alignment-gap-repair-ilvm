@@ -177,6 +177,36 @@
 
     <section class="panel" id="m3">
       <div class="panel-head">
+        <h2>采样档位分段（{{ preview.segments | length }} 段）</h2>
+        <div class="panel-actions">
+          <span class="tag">模块 3/6 · 分段口径</span>
+        </div>
+      </div>
+      <div class="table-wrap">
+        <table class="dense">
+          <thead><tr><th style="width:44px">#</th><th style="width:70px">档位</th><th style="width:64px">类型</th>
+            <th style="width:170px">分段时间</th><th style="width:60px">桶数</th><th style="width:70px">原始点</th>
+            <th style="width:80px">段覆盖率</th><th>可观测能力</th></tr></thead>
+          <tbody>
+            {% for seg in preview.segment_stats %}
+            <tr>
+              <td>{{ seg.segment_index }}</td>
+              <td><span class="tag {% if seg.tier == 'high' %}ok{% else %}warn{% endif %}">{{ seg.interval_s }}s</span></td>
+              <td class="small">{{ '高频聚合' if seg.tier == 'high' else '低频沿用' }}</td>
+              <td class="small muted nowrap">{{ seg.start_time[11:16] }} → {{ seg.end_time[11:16] }}</td>
+              <td class="num">{{ seg.expected_cells }}</td>
+              <td class="num">{{ seg.points }}</td>
+              <td class="num">{{ seg.coverage | pct(2) }}</td>
+              <td class="small muted">{{ seg.observability }}</td>
+            </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="panel" id="m3-grid">
+      <div class="panel-head">
         <h2>网格重采样预览（前 60 分钟）</h2>
         <div class="panel-actions">
           <span class="tag">模块 3/6</span>
@@ -187,7 +217,7 @@
         <table class="dense">
           <thead>
             <tr><th style="width:170px">分钟桶</th><th style="width:96px">值（{{ preview.metric_unit }}）</th>
-              <th style="width:110px">来源</th><th style="width:80px">原始点数</th><th style="width:76px">carried</th><th>min / max</th></tr>
+              <th style="width:110px">来源</th><th style="width:80px">原始点数</th><th style="width:90px">档位分段</th><th style="width:76px">carried</th><th>min / max</th></tr>
           </thead>
           <tbody>
             {% for cell in preview.preview %}
@@ -197,11 +227,12 @@
               <td>
                 {% if cell.source == 'agg' %}<span class="tag">聚合 agg</span>
                 {% elif cell.source == 'sample' %}<span class="tag">原始采样</span>
-                {% elif cell.source == 'hold' %}<span class="tag warn">沿用 hold</span>
+                {% elif cell.source == 'hold' %}<span class="tag warn">沿用 hold{% if cell.cross_segment %}·跨档{% endif %}</span>
                 {% elif cell.source == 'interpolated' %}<span class="tag warn">插补</span>
                 {% else %}<span class="tag err">空缺</span>{% endif %}
               </td>
               <td class="num">{{ cell.samples }}</td>
+              <td><span class="tag">{{ cell.interval_s }}s #{{ cell.segment_index }}</span></td>
               <td>{% if cell.carried %}<span class="tag warn">是</span>{% else %}<span class="muted">否</span>{% endif %}</td>
               <td class="small muted nowrap">
                 {% if cell.min is not none %}{{ cell.min | fmt(3) }} / {{ cell.max | fmt(3) }}{% else %}—{% endif %}

@@ -21,14 +21,42 @@ def grade_for(coverage: float | None) -> str:
     return "C"
 
 
-def coverage_report(cells: list[dict], expected_cells: int, gaps: dict) -> dict:
+def coverage_report(
+    cells: list[dict],
+    expected_cells: int,
+    gaps: dict,
+    segment_stats: list[dict] | None = None,
+) -> dict:
     values = [c for c in cells if c["value"] is not None]
     raw = [c for c in cells if c["source"] in ("agg", "sample")]
     carried = [c for c in cells if c.get("carried")]
     interpolated = [c for c in cells if c["source"] == "interpolated"]
     missing = [c for c in cells if c["value"] is None]
+    cross = [c for c in cells if c.get("cross_segment")]
     expected = max(1, expected_cells)
     coverage = len(values) / expected
+    segment_stats = segment_stats or []
+    # 各档位分段的覆盖口径：让质量报告能按「该段可观测能力」解释，而不是一个总覆盖率盖过档位差异。
+    segment_coverage = [
+        {
+            "segment_index": s["segment_index"],
+            "interval_s": s["interval_s"],
+            "tier": s["tier"],
+            "start_time": s["start_time"],
+            "end_time": s["end_time"],
+            "expected_cells": s["expected_cells"],
+            "raw_cells": s["raw_cells"],
+            "carried_cells": s["carried_cells"],
+            "interpolated_cells": s["interpolated_cells"],
+            "missing_cells": s["gap_cells"],
+            "coverage": s["coverage"],
+            "raw_coverage": s["raw_coverage"],
+            "grade": grade_for(s["coverage"]),
+            "observability": s["observability"],
+        }
+        for s in segment_stats
+    ]
+    weakest = min(segment_coverage, key=lambda r: r["coverage"]) if segment_coverage else None
     return {
         "expected_cells": expected,
         "grid_cells": len(cells),
@@ -43,6 +71,10 @@ def coverage_report(cells: list[dict], expected_cells: int, gaps: dict) -> dict:
         "gap_count": gaps.get("count", 0),
         "gap_cells": gaps.get("interpolated_cells", 0) + gaps.get("unrepaired_cells", 0),
         "unrepaired_cells": gaps.get("unrepaired_cells", 0),
+        "segment_count": len(segment_coverage),
+        "cross_segment_cells": len(cross),
+        "segment_coverage": segment_coverage,
+        "weakest_segment": weakest,
     }
 
 
@@ -98,11 +130,15 @@ CSV_COLUMNS = [
     "device_id",
     "metric",
     "interval_s",
+    "segment_count",
+    "segment_intervals",
+    "publish_status",
     "expected_cells",
     "raw_cells",
     "carried_cells",
     "interpolated_cells",
     "unrepaired_cells",
+    "cross_segment_cells",
     "valid_cells",
     "coverage",
     "grade",
@@ -121,16 +157,23 @@ def report_csv(rows: list[dict]) -> str:
     for row in rows:
         drift = row.get("drift") or {}
         cov = row["coverage"]
+        seg_intervals = "/".join(
+            str(s["interval_s"]) + "s" for s in cov.get("segment_coverage", [])
+        )
         writer.writerow(
             [
                 row["device_id"],
                 row["metric"],
                 row["interval_s"],
+                cov.get("segment_count", ""),
+                seg_intervals,
+                row.get("publish_status", ""),
                 cov["expected_cells"],
                 cov["raw_cells"],
                 cov["carried_cells"],
                 cov["interpolated_cells"],
                 cov["unrepaired_cells"],
+                cov.get("cross_segment_cells", 0),
                 cov["valid_cells"],
                 f"{cov['coverage']:.4f}",
                 cov["grade"],
@@ -141,4 +184,54 @@ def report_csv(rows: list[dict]) -> str:
                 "" if drift.get("drifted") is None else ("yes" if drift["drifted"] else "no"),
             ]
         )
+    return buffer.getvalue()
+
+
+def segment_csv(rows: list[dict]) -> str:
+    """分段明细 CSV：每行一个采样档位分段，可核对档位区间、桶归属与分段覆盖。"""
+    columns = [
+        "device_id",
+        "metric",
+        "segment_index",
+        "interval_s",
+        "tier",
+        "start_time",
+        "end_time",
+        "expected_cells",
+        "raw_cells",
+        "carried_cells",
+        "interpolated_cells",
+        "missing_cells",
+        "coverage",
+        "raw_coverage",
+        "grade",
+        "publish_status",
+        "observability",
+    ]
+    buffer = io.StringIO()
+    writer = csv.writer(buffer)
+    writer.writerow(columns)
+    for row in rows:
+        for seg in row["coverage"].get("segment_coverage", []):
+            writer.writerow(
+                [
+                    row["device_id"],
+                    row["metric"],
+                    seg["segment_index"],
+                    seg["interval_s"],
+                    seg["tier"],
+                    seg.get("start_time", ""),
+                    seg.get("end_time", ""),
+                    seg["expected_cells"],
+                    seg["raw_cells"],
+                    seg["carried_cells"],
+                    seg["interpolated_cells"],
+                    seg["missing_cells"],
+                    f"{seg['coverage']:.4f}",
+                    f"{seg['raw_coverage']:.4f}",
+                    seg["grade"],
+                    row.get("publish_status", ""),
+                    seg["observability"],
+                ]
+            )
     return buffer.getvalue()

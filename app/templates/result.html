@@ -75,6 +75,7 @@
   <div class="panel-head">
     <div class="segmented">
       <button type="button" data-tab-target="tab-grid" class="active">网格预览</button>
+      <button type="button" data-tab-target="tab-segment">档位分段</button>
       <button type="button" data-tab-target="tab-drift">漂移依据</button>
       <button type="button" data-tab-target="tab-gap">缺口明细</button>
       <button type="button" data-tab-target="tab-hour">小时摘要</button>
@@ -82,7 +83,11 @@
     </div>
     <div class="panel-actions">
       <span class="tag">{{ run.preview | length }} 行预览 · 共 {{ run.window.cells }} 格</span>
+      {% if run.publication %}
+      <span class="tag ok">已发布 <code>{{ run.publication.pub_id }}</code></span>
+      {% else %}
       <span class="tag">run <code>{{ run.run_id }}</code></span>
+      {% endif %}
     </div>
   </div>
 
@@ -101,7 +106,7 @@
           <thead>
             <tr><th style="width:170px">分钟桶</th><th style="width:110px">值（{{ run.metric_unit }}）</th>
               <th style="width:110px">来源</th><th style="width:80px">原始点数</th>
-              <th style="width:76px">carried</th><th>min / max</th></tr>
+              <th style="width:90px">档位分段</th><th style="width:76px">carried</th><th>min / max</th></tr>
           </thead>
           <tbody>
             {% for cell in run.preview %}
@@ -111,11 +116,12 @@
               <td>
                 {% if cell.source == 'agg' %}<span class="tag">聚合 agg</span>
                 {% elif cell.source == 'sample' %}<span class="tag">原始采样</span>
-                {% elif cell.source == 'hold' %}<span class="tag warn">沿用 hold</span>
+                {% elif cell.source == 'hold' %}<span class="tag warn">沿用 hold{% if cell.cross_segment %}·跨档{% endif %}</span>
                 {% elif cell.source == 'interpolated' %}<span class="tag warn">插补</span>
                 {% else %}<span class="tag err">空缺</span>{% endif %}
               </td>
               <td class="num">{{ cell.samples }}</td>
+              <td><span class="tag">{{ cell.interval_s }}s #{{ cell.segment_index }}</span></td>
               <td>{% if cell.carried %}<span class="tag warn">是</span>{% else %}<span class="muted">否</span>{% endif %}</td>
               <td class="small muted nowrap">
                 {% if cell.min is not none %}{{ cell.min | fmt(3) }} / {{ cell.max | fmt(3) }}{% else %}—{% endif %}
@@ -129,6 +135,49 @@
         <p class="small muted" style="margin:0">
           聚合 {{ run.grid.agg_cells }} 格 · 原始采样 {{ run.grid.sample_cells }} 格 · 沿用 carried {{ run.grid.held_cells }} 格 ·
           空缺 {{ run.grid.empty_cells }} 格（含未修复）。表格在容器内滚动，页面只滚主区。
+        </p>
+      </div>
+    </div>
+
+    <div id="tab-segment" class="tab-panel" hidden>
+      <div class="panel-head" style="border-top:0">
+        <h3>采样档位分段（{{ run.segments | length }} 段，按连续档位解释）</h3>
+        <div class="panel-actions">
+          <span class="tag">短暂补传/稀疏点已并入邻段</span>
+          {% if run.publication %}<span class="tag ok">发布 {{ run.publication.status }}</span>{% endif %}
+        </div>
+      </div>
+      <div class="table-wrap auto">
+        <table class="dense">
+          <thead><tr><th style="width:44px">#</th><th style="width:78px">档位</th><th style="width:64px">类型</th>
+            <th style="width:160px">分段时间</th><th style="width:70px">桶区间</th><th style="width:60px">桶数</th>
+            <th style="width:64px">原始点</th><th style="width:70px">段覆盖率</th><th style="width:48px">分级</th><th>可观测能力</th></tr></thead>
+          <tbody>
+            {% for seg in run.segment_stats %}
+            <tr>
+              <td>{{ seg.segment_index }}</td>
+              <td><span class="tag {% if seg.tier == 'high' %}ok{% else %}warn{% endif %}">{{ seg.interval_s }}s</span></td>
+              <td class="small">{{ '高频聚合' if seg.tier == 'high' else '低频沿用' }}</td>
+              <td class="small muted nowrap">{{ seg.start_time }} → {{ seg.end_time }}</td>
+              <td class="num small">{{ seg.start_bucket }}–{{ seg.end_bucket }}</td>
+              <td class="num">{{ seg.expected_cells }}</td>
+              <td class="num">{{ seg.points }}</td>
+              <td class="num">{{ seg.coverage | pct(2) }}</td>
+              <td>
+                {% if seg.coverage >= 0.98 %}<span class="tag ok">A</span>{% elif seg.coverage >= 0.95 %}<span class="tag warn">B</span>{% else %}<span class="tag err">C</span>{% endif %}
+              </td>
+              <td class="small muted">{{ seg.observability }}</td>
+            </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+      <div class="panel-body tight">
+        <p class="small muted" style="margin:0">
+          档位由相邻采样间隔带宽识别（1s/5s/60s/120s/180s）；短于 60s 且少于 3 点的游程（补传突发、孤立稀疏点）
+          并入相邻档位，不带偏整段档位。缺口在分段边界重算，线性插补绝不跨分段；跨档位的 hold 沿用在网格预览中标记 cross_segment。
+          {% if run.publication %}发布版本 <code>{{ run.publication.pub_id }}</code>，
+          分段作业状态：{% for j in run.publication.segment_jobs %}#{{ j.segment_index }} {{ j.status }}（{{ j.attempts }} 次）{% if not loop.last %} · {% endif %}{% endfor %}。{% endif %}
         </p>
       </div>
     </div>
@@ -225,13 +274,17 @@
       </div>
       <div class="table-wrap auto">
         <table class="dense">
-          <thead><tr><th style="width:180px">小时起点</th><th style="width:64px">格数</th><th>min</th><th>max</th>
+          <thead><tr><th style="width:180px">小时起点</th><th style="width:64px">格数</th><th style="width:110px">跨越档位</th><th>min</th><th>max</th>
             <th>mean</th><th>p95</th><th style="width:74px">缺口格</th><th style="width:74px">carried</th></tr></thead>
           <tbody>
             {% for hour in run.hourly %}
             <tr>
               <td class="small muted nowrap">{{ hour.hour_start }}</td>
               <td class="num">{{ hour.cells }}</td>
+              <td class="small nowrap">
+                {% for iv in hour.segment_intervals %}<span class="tag">{{ iv }}s</span>{% endfor %}
+                {% if hour.cross_segment %}<span class="tag warn">跨档</span>{% endif %}
+              </td>
               <td class="num">{{ hour.min | fmt(3) }}</td>
               <td class="num">{{ hour.max | fmt(3) }}</td>
               <td class="num">{{ hour.mean | fmt(3) }}</td>
@@ -267,6 +320,25 @@
                 <tr><th>coverage = 有效/应到</th><td><strong>{{ run.coverage.coverage | pct(2) }}</strong></td></tr>
                 <tr><th>分级（≥98% A / ≥95% B / else C）</th>
                   <td><span class="tag {% if run.coverage.grade == 'A' %}ok{% elif run.coverage.grade == 'B' %}warn{% else %}err{% endif %}">{{ run.coverage.grade }}</span></td></tr>
+              </tbody>
+            </table>
+          </div>
+          <div class="panel-body tight">
+            <h3 style="margin:4px 0 6px">按采样档位分段的覆盖率（各段可观测能力口径）</h3>
+            <table class="dense">
+              <thead><tr><th style="width:44px">段</th><th style="width:60px">档位</th><th style="width:64px">应到/原始</th>
+                <th style="width:74px">段覆盖率</th><th style="width:44px">分级</th><th>说明</th></tr></thead>
+              <tbody>
+                {% for seg in run.coverage.segment_coverage %}
+                <tr>
+                  <td>#{{ seg.segment_index }}</td>
+                  <td><span class="tag {% if seg.tier == 'high' %}ok{% else %}warn{% endif %}">{{ seg.interval_s }}s</span></td>
+                  <td class="num small">{{ seg.expected_cells }} / {{ seg.raw_cells }}</td>
+                  <td class="num">{{ seg.coverage | pct(2) }}</td>
+                  <td><span class="tag {% if seg.grade == 'A' %}ok{% elif seg.grade == 'B' %}warn{% else %}err{% endif %}">{{ seg.grade }}</span></td>
+                  <td class="small muted">{{ seg.observability }}</td>
+                </tr>
+                {% endfor %}
               </tbody>
             </table>
           </div>

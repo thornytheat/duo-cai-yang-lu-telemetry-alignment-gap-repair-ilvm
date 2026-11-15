@@ -47,6 +47,11 @@
     <div class="k-value">{{ stats.avg_coverage | pct(2) }}</div>
     <div class="k-note">A {{ stats.grade_counts.get('A', 0) }} / B {{ stats.grade_counts.get('B', 0) }} / C {{ stats.grade_counts.get('C', 0) }} 级</div>
   </div>
+  <div class="kpi">
+    <div class="k-label">已发布版本</div>
+    <div class="k-value">{{ stats.published_count }}</div>
+    <div class="k-note">{{ stats.multi_segment_pairs }} 条多档位序列 · 原子切换</div>
+  </div>
 </div>
 
 <div class="split result">

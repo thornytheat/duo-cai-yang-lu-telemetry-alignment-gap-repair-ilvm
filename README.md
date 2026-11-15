@@ -1,39 +1,67 @@
 # tsgrid · 多采样率遥测对齐与缺口修复
 
-产线设备遥测统一到 **1 分钟网格**：定量估计设备时钟漂移、重采样（聚合 / hold 沿用）、
-判定并有限修复缺口、出小时摘要与覆盖率分级。
+产线设备遥测统一到 **1 分钟网格**：按**连续采样档位分段**识别 1s/5s/60s 上报切换、
+定量估计设备时钟漂移、分段重采样（聚合 / hold 沿用）、在分段边界重算缺口、
+出小时/分段摘要与覆盖率分级，并以**可断点续跑、原子切换**的发布版本落地。
 
-使用者：设备运维分析组。样例为产线 A 三台设备 6 小时数据（1s / 5s / 60s 三种采样率，
-其中 `LINE-A-03` 时钟快 **+37 秒**）。
+使用者：设备运维分析组。样例为产线 A 四台设备 6 小时数据（1s / 5s / 60s 三种采样率，
+其中 `LINE-A-03` 时钟快 **+37 秒**，`LINE-A-04` 一条温度序列在 1s/5s/60s 三档间切换）。
 
 ## 能力
 
 | 模块 | 页面区块 | 端点 / 函数 |
 |---|---|---|
 | 数据导入 | 首页设备概览、工作台数据源 | `POST /api/import` · `app/telemetry.py` |
+| 档位分段 | 工作台/结果页「采样档位分段」、复核页分段表 | `app/segments.py` |
 | 漂移估计 | 结果页「一、时钟漂移估计」 | `app/drift.py` |
 | 网格重采样 | 结果页「二、网格预览（前 60 分钟）」 | `app/grid.py` |
 | 缺口判定 | 结果页「三、缺口明细」 | `app/gaps.py` |
 | 摘要 | 结果页「四、小时摘要」 | `app/summary.py` |
-| 质量报告 | `/review`、`/api/report(.csv)` | `app/quality.py` |
+| 质量报告 | `/review`、`/api/report(.csv)`、分段 CSV | `app/quality.py` |
+| 分段发布 | `/api/publications`、结果页发布状态 | `app/publication.py` · `store.py` |
 
 ## 核心规则（全部后端真算，纯函数模块可直接单测）
 
+0. **连续采样档位分段**：不再用整段相邻间隔中位数给一条序列定一个采样率。
+   - 相邻间隔按带宽归入 1s/5s/60s/120s/180s 五档，点级标签 + 游程切成连续同档分段；
+   - **短暂补传/个别稀疏点不带偏整段**：短于 60s 且少于 3 点的游程并入相邻档位（AND 条件），
+     不单独切段；足够长的真实档位切换才成段；
+   - 每个分钟桶按桶内多数点归属一个分段，断采空桶并入前一段——分段连续覆盖整个窗口；
+   - 后续网格、缺口、摘要、覆盖率全部在分段口径上重算，质量报告按**各段可观测能力**解释覆盖
+     （高频档桶内可聚合，低频档每桶至多 1 个观测点，缺报只能 hold 或留空）。
 1. **时钟漂移估计**：以「指标阈值穿越时刻」为锚点，先用最近邻滞后中位数粗对齐，
    再配对做最小二乘拟合 `t_ref = a · t_dev + b`。
    - 偏移 `offset = −b/a`（窗口起点，正值=设备表快），走时偏差 `(1/a − 1)·1e6` ppm；
    - 残差 `RMSE` 即「按 a、b 校正后」的剩余时间误差；
    - `|offset| > 阈值`（默认 5s）判定漂移并给出校正建议；
-   - 只用相邻采样间隔 ≤ 90s 的区段取锚点，拟合后按 MAD 剔除跨拐点离群锚点（最多 3 轮）。
-2. **统一网格（1 分钟桶）**：采样率高于桶（`1s`/`5s`）→ 桶内 `mean/max/min` + 计数（`agg`）；
-   采样率低于桶或该段降级上报 → `hold` 沿用前值并标记 `carried=true`（计数）。
+   - 只用相邻采样间隔 ≤ 90s 的区段取锚点，拟合后按 MAD 剔除跨拐点离群锚点（最多 3 轮）；
+   - 基准设备选择按「最高档位最密」而不是整段中位数，多档位序列不会因稀疏段失去基准资格。
+2. **统一网格（1 分钟桶，分段解释）**：高频档（`1s`/`5s`）→ 桶内 `mean/max/min` + 计数（`agg`）；
+   低频档（`60s/120s/180s`）→ 桶内最后一点（`sample`），该档降级上报 → `hold` 沿用前值并标记 `carried`。
    hold 仅在「前后原始格相距 ≤ 3 格」且「前后采样点间距 > 1.5 桶」时生效——
-   1s 设备偶尔丢一格不会被静默补值，长断采也不会被掩盖。
-3. **缺口**：网格内无原始点且前后都有原始点 → `gap`；`≤3` 格线性插补、`>3` 格标记 `unrepaired`；
-   序列**首尾不外推**（开头/结尾空缺只登记为未修复，绝不填值）。
-4. **摘要**：每小时 `min/max/mean/p95` + 缺口格数 + carried 格数（p95 为线性插值分位数）。
+   1s 档偶尔丢一格不会被静默补值，长断采也不会被掩盖。
+3. **缺口（分段边界重算）**：每段内部「无原始点且前后都有原始点 → gap」；
+   `≤3` 格线性插补、`>3` 格标记 `unrepaired`；**线性插补绝不跨分段**。
+   分段交界处的空桶：间距 ≤ hold 上限时允许沿用前档最后观测值（`cross_segment=true` 显式标记），
+   长断采仍登记为段尾未修复。序列**首尾不外推**（开头/结尾空缺只登记，绝不填值）。
+4. **摘要**：每小时 `min/max/mean/p95` + 缺口格数 + carried 格数，并标注该小时跨越的档位；
+   另有分段摘要（每档的桶数、覆盖率与可观测能力解释）。p95 为线性插值分位数。
 5. **质量分**：`coverage = 有效格 / 应到格`（有效 = 原始 ∪ 沿用 ∪ 插补），
-   分级 `≥0.98 A / ≥0.95 B / else C`；另给出 raw 覆盖率（不含沿用与插补）以便区分「有数据」和「补出来的数据」。
+   分级 `≥0.98 A / ≥0.95 B / else C`；同时给出 raw 覆盖率与**每个分段的覆盖率/分级**，
+   区分「有数据」和「补出来的数据」，也区分不同档位下的可观测能力。
+6. **分段发布（断点续跑 / 原子切换 / 幂等）**：见下节。
+
+## 分段发布语义（`app/publication.py`）
+
+一条序列的对齐结果按档位分段拆成独立作业（`segment_jobs` 表，每段一行）：
+
+- **断点续跑**：分段作业成功才落 `result_json`（done）；进程中断后重跑，done 的分段
+  **直接复用、绝不重算**，只重放 pending/failed 的分段（从最后完成的分段续跑）；
+- **原子切换**：全部分段完成后，在**单个 SQLite 事务**里写入完整 payload、置 `published`
+  并把 active 指针从旧版切到新版；任一作业失败则版本标 `failed`，**旧 active 版本保留**；
+- **幂等重跑**：`pub_id` 由输入内容哈希（数据集 sha + 序列点 + 阈值）决定，
+  重跑同一批返回同一个 `pub_id`、同一份结果，作业 `attempts` 不增加；
+- 页面（结果页/复核页/首页）与导出（质量 CSV、分段 CSV）均可核对档位分段与发布状态。
 
 ## 启动
 
@@ -55,7 +83,10 @@ docker compose run --rm app python -m pytest -q
    **2 处缺口**（3 格插补 / 5 格未修复）、覆盖率 98.61% → **A**。
 4. 切 `LINE-A-02` 温度：3 分钟降级段被 hold 沿用（carried 30 格），覆盖率 95.28% → **B**。
 5. 切 `LINE-A-03` 压力：01:40–02:05 断采，覆盖率 91.67% → **C**。
-6. `/review` 看三台设备 A/B/C 分级与跨设备对比，导出 CSV。
+6. 选 `LINE-A-04` 温度：一条序列识别出 **5 个档位分段**（1s→5s→60s→5s→1s），
+   段内补传突发/孤立稀疏点被吸收不切段；「档位分段」页可核对每段桶区间与段覆盖率。
+7. `/review` 看四台设备 A/B/C 分级、逐序列分段表与发布状态，导出质量 CSV 与分段 CSV；
+   `GET /api/publications` 可核对 active 版本与每个分段作业的 done 状态。
 
 ## API
 
@@ -63,11 +94,14 @@ docker compose run --rm app python -m pytest -q
 |---|---|---|
 | GET | `/health` | 健康检查 |
 | POST | `/api/import` | 幂等导入样例遥测，返回数据集/设备清单 |
-| POST | `/api/align` | `{device_id, metric, offset_threshold?}` → 对齐结果（含依据与阶段耗时） |
+| POST | `/api/align` | `{device_id, metric, offset_threshold?}` → 走分段发布器执行对齐，返回结果（含 `pub_id`、`publish_status`、分段覆盖） |
 | GET | `/api/runs/{run_id}` | 取某次对齐结果 JSON |
-| GET | `/api/report` | 全部「设备 × 指标」的质量报告 JSON |
-| GET | `/api/report.csv` | 质量报告 CSV（`device_id,metric,...,coverage,grade,...`） |
-| GET | `/result/{run_id}` | 结果页（漂移依据、网格预览、缺口明细、小时摘要、覆盖率） |
+| GET | `/api/report` | 全部「设备 × 指标」的质量报告 JSON（含分段与发布状态） |
+| GET | `/api/report.csv` | 质量报告 CSV（含 segment_count / segment_intervals / publish_status / cross_segment_cells） |
+| GET | `/api/report.segments.csv` | 分段明细 CSV（每个采样档位一行，含桶区间、段覆盖率、可观测能力解释） |
+| GET | `/api/publications` | 全部发布版本（状态、active 指针、分段数） |
+| GET | `/api/publications/{pub_id}` | 单个发布版本详情（含每个分段作业状态/尝试次数与完整 payload） |
+| GET | `/result/{run_id}` | 结果页（漂移依据、档位分段、网格预览、缺口明细、小时摘要、覆盖率） |
 | GET | `/`、`/workbench`、`/review` | 首页 / 工作台 / 质量报告 |
 
 错误输入统一 4xx 中文提示：不存在的设备、设备没有该指标、阈值非数字或越界、请求体非 JSON。
@@ -92,25 +126,31 @@ app/
   main.py        FastAPI 路由（薄）
   settings.py    阈值/路径常量
   telemetry.py   数据导入、字段校验、采样率识别、设备清单
+  segments.py    连续采样档位分段（带宽识别 + 短游程平滑 + 桶归属）
   drift.py       时钟漂移估计（锚点配对 + 鲁棒最小二乘）
-  grid.py        1 分钟网格重采样（聚合 / hold carried）
-  gaps.py        缺口判定与有限插补（首尾不外推）
-  summary.py     小时摘要（min/max/mean/p95 + 缺口 + carried）
-  quality.py     覆盖率、分级、跨设备汇总、CSV
-  pipeline.py    6 步编排 + 阶段耗时
-  store.py       SQLite（数据集、运行结果、seed 版本）
+  grid.py        1 分钟网格重采样（分段聚合 / hold carried / 跨档标记）
+  gaps.py        分段缺口判定与有限插补（首尾不外推、插补不跨段）
+  summary.py     小时摘要 + 分段摘要（min/max/mean/p95 + 可观测能力）
+  quality.py     覆盖率、分级、跨设备汇总、质量/分段 CSV
+  publication.py 分段发布器（断点续跑、原子切换、幂等重跑，worker 可注入）
+  pipeline.py    6 步编排 + 可复用纯函数部件 + 阶段耗时
+  store.py       SQLite（数据集、运行结果、发布版本、分段作业、seed 版本）
   seed.py        幂等 seed
   templates/     index / workbench / result / review
   static/        app.js、style.css、shell.css（原生，无框架无 CDN）
-sample_data/telemetry/  3 台设备 6 小时 CSV + _generate.py（确定性生成脚本）
-tests/                  test_drift / test_resample / test_gaps / test_api
+sample_data/telemetry/  4 台设备 6 小时 CSV + _generate.py（确定性生成脚本）
+tests/                  test_drift / test_resample / test_gaps / test_segments /
+                         test_publication / test_api
 ```
 
 ## 已知限制
 
 - 漂移估计依赖指标存在周期性变化；平坦序列无法取锚点，会明确报错而不是给 0。
 - 锚点按「阈值穿越」配对，若设备时钟偏移超过 ±300s（`DRIFT_ANCHOR_MAX_SKEW_S`）需先人工确认。
-- hold 只做「沿用前值」不做趋势外推；首尾缺口一律不填值。
-- 覆盖率把沿用与插补算作有效格，因此同时输出 raw 覆盖率与 carried/插补计数供复核。
-- 样例数据为确定性生成（三角波 + 极小噪声），非真实产线采集；1s × 6 小时共 21120 行，
-  仓库体积约 2.5MB，属于该场景固有体量。
+- hold 只做「沿用前值」不做趋势外推；首尾缺口一律不填值；线性插补不跨采样档位分段。
+- 档位识别基于 1s/5s/60s/120s/180s 五档固定带宽，带宽之外的间隔归入最接近档（不造新档位）；
+  若未来引入其它 cadence，需要在 `segments.CADENCE_BANDS` 增列。
+- 覆盖率把沿用与插补算作有效格，因此同时输出 raw 覆盖率、分段覆盖率与 carried/插补计数供复核。
+- 发布版本与分段作业存于 SQLite；原子切换依赖单库事务，多实例并发写同一序列需外加串行化。
+- 样例数据为确定性生成（三角波 + 极小噪声），非真实产线采集；新增 LINE-A-04 后
+  1s/5s/60s 混合共约 4 万行，属于该场景固有体量。

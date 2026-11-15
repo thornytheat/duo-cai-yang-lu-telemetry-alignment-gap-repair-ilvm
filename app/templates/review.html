@@ -4,6 +4,7 @@
 {% block meta %}<span class="dot {% if report.summary.drifted_pairs %}warn{% else %}ok{% endif %}"></span>数据集 {{ dataset.dataset_id }} · {{ report.summary.pairs }} 个序列 · 阈值 {{ report.threshold_s | fmt(1) }}s{% endblock %}
 {% block actions %}
 <a class="btn secondary small" href="/api/report">JSON</a>
+<a class="btn secondary small" href="/api/report.segments.csv">分段 CSV</a>
 <a class="btn small" href="/api/report.csv">导出 CSV</a>
 {% endblock %}
 {% block status_left %}全部 {{ report.summary.pairs }} 个「设备 × 指标」逐条走完对齐流水线后汇总 · 同一数据集按阈值缓存重算{% endblock %}
@@ -101,18 +102,35 @@
       <div class="table-wrap roomy">
         <table class="dense" id="pair-table">
           <thead>
-            <tr><th style="width:100px">设备</th><th style="width:56px">指标</th><th style="width:52px">采样率</th>
-              <th style="width:54px">应到格</th><th style="width:54px">原始格</th><th style="width:54px">沿用</th>
-              <th style="width:50px">插补</th><th style="width:58px">未修复</th><th style="width:72px">coverage</th>
-              <th style="width:46px">分级</th><th style="width:46px">缺口</th><th style="width:150px">漂移 offset / ppm / 残差</th></tr>
+            <tr><th style="width:96px">设备</th><th style="width:52px">指标</th><th style="width:52px">中位数</th>
+              <th style="width:128px">档位分段</th><th style="width:84px">发布状态</th>
+              <th style="width:50px">应到格</th><th style="width:50px">原始格</th><th style="width:48px">沿用</th>
+              <th style="width:46px">插补</th><th style="width:52px">未修复</th><th style="width:66px">coverage</th>
+              <th style="width:44px">分级</th><th style="width:44px">缺口</th><th style="width:140px">漂移 offset / ppm / 残差</th></tr>
           </thead>
           <tbody>
             {% for row in report.rows %}
             <tr data-device="{{ row.device_id }}" data-metric="{{ row.metric }}"
-                data-search="{{ row.device_id }} {{ row.metric }} {{ row.metric_label }} {{ row.coverage.grade }}">
+                data-search="{{ row.device_id }} {{ row.metric }} {{ row.metric_label }} {{ row.coverage.grade }} {{ row.publish_status }}">
               <td class="nowrap">{{ row.device_id }}</td>
               <td class="small nowrap">{{ row.metric_label }}</td>
               <td class="num">{{ row.interval_s }}s</td>
+              <td class="small nowrap">
+                {% if row.coverage.segment_count and row.coverage.segment_count > 1 %}
+                  {% for seg in row.coverage.segment_coverage %}
+                  <span class="tag {% if seg.tier == 'high' %}ok{% else %}warn{% endif %}"
+                        title="{{ seg.observability }}">{{ seg.interval_s }}s·{{ seg.grade }}</span>
+                  {% endfor %}
+                {% else %}
+                  <span class="tag">{{ row.interval_s }}s 单档</span>
+                {% endif %}
+              </td>
+              <td>
+                {% if row.publish_status == 'published' %}<span class="tag ok">已发布</span>
+                {% elif row.publish_status == 'failed' %}<span class="tag err">失败</span>
+                {% elif row.publish_status == 'running' %}<span class="tag warn">进行中</span>
+                {% else %}<span class="tag">未发布</span>{% endif %}
+              </td>
               <td class="num">{{ row.coverage.expected_cells }}</td>
               <td class="num">{{ row.coverage.raw_cells }}</td>
               <td class="num">{% if row.coverage.carried_cells %}<span class="tag warn">{{ row.coverage.carried_cells }}</span>{% else %}0{% endif %}</td>
@@ -142,6 +160,54 @@
       {% else %}
       <div class="empty"><strong>当前数据集没有可汇总的序列</strong>先到总览页校验并载入样例遥测。</div>
       {% endif %}
+    </section>
+
+    <section class="panel">
+      <div class="panel-head">
+        <h2>三、采样档位分段与各段可观测能力</h2>
+        <div class="panel-actions">
+          <span class="tag">按分段解释覆盖</span>
+          <a class="btn secondary small" href="/api/report.segments.csv">导出分段 CSV</a>
+        </div>
+      </div>
+      <div class="table-wrap roomy">
+        <table class="dense">
+          <thead>
+            <tr><th style="width:96px">设备</th><th style="width:52px">指标</th><th style="width:46px">段</th>
+              <th style="width:58px">档位</th><th style="width:150px">分段时间</th>
+              <th style="width:52px">应到格</th><th style="width:52px">原始格</th><th style="width:48px">沿用</th>
+              <th style="width:52px">未修复</th><th style="width:64px">段覆盖率</th><th style="width:44px">分级</th>
+              <th>可观测能力解释</th></tr>
+          </thead>
+          <tbody>
+            {% for row in report.rows %}
+            {% for seg in row.coverage.segment_coverage %}
+            <tr data-device="{{ row.device_id }}" data-metric="{{ row.metric }}"
+                data-search="{{ row.device_id }} {{ row.metric }} {{ seg.interval_s }}s">
+              <td class="nowrap">{{ row.device_id }}</td>
+              <td class="small nowrap">{{ row.metric_label }}</td>
+              <td class="num">#{{ seg.segment_index }}</td>
+              <td><span class="tag {% if seg.tier == 'high' %}ok{% else %}warn{% endif %}">{{ seg.interval_s }}s {{ seg.tier }}</span></td>
+              <td class="small muted nowrap">{{ seg.start_time[11:16] }} → {{ seg.end_time[11:16] }}</td>
+              <td class="num">{{ seg.expected_cells }}</td>
+              <td class="num">{{ seg.raw_cells }}</td>
+              <td class="num">{{ seg.carried_cells }}</td>
+              <td class="num">{% if seg.missing_cells %}<span class="tag err">{{ seg.missing_cells }}</span>{% else %}0{% endif %}</td>
+              <td class="num">{{ seg.coverage | pct(2) }}</td>
+              <td><span class="tag {% if seg.grade == 'A' %}ok{% elif seg.grade == 'B' %}warn{% else %}err{% endif %}">{{ seg.grade }}</span></td>
+              <td class="small muted">{{ seg.observability }}</td>
+            </tr>
+            {% endfor %}
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+      <div class="panel-body tight">
+        <p class="small muted" style="margin:0">
+          每个分段按自身档位的可观测能力解释：高频档（&lt;60s）桶内可聚合 mean/max/min；低频档每桶至多 1 个观测点，
+          缺报只能 hold 沿用或留空。短暂补传/个别稀疏点（&lt;60s 且 &lt;3 点）并入相邻档位，不单独切段。
+        </p>
+      </div>
     </section>
   </div>
 
@@ -178,13 +244,17 @@
           </div>
         </div>
 
-        <h3 style="margin:2px 0 4px">三、跨设备对比要点</h3>
+        <h3 style="margin:2px 0 4px">四、跨设备对比要点</h3>
         <ul class="list small" style="margin:0">
+          <li><strong>采样档位分段：</strong>序列在 1s/5s/60s 间切换时按连续档位分段解释，
+            不再用整段中位数一个采样率盖过全段；LINE-A-04 一条温度序列包含 5 个档位分段。</li>
           <li><strong>采样率差异：</strong>1s 设备每格聚合 60 个原始点，5s 设备 12 个，60s 设备 1 个（直接沿用原值）。</li>
-          <li><strong>缺采段对齐：</strong>全线缺采的 03:00–03:02 与 04:10–04:14 在三台设备上同时出现，缺口判定一致；
+          <li><strong>缺采段对齐：</strong>全线缺采的 03:00–03:02 与 04:10–04:14 在各设备上同时出现，缺口按分段边界重算；
             各设备自身的断采（如 LINE-A-03 压力 01:40–02:05）只影响本设备覆盖率。</li>
           <li><strong>降级段：</strong>LINE-A-02 温度 02:10–02:55 以 180s 上报、LINE-A-03 05:00–05:50 以 120s 上报，
-            1 分钟网格以 hold 沿用并计入 carried，不误判为缺口。</li>
+            1 分钟网格以 hold 沿用并计入 carried，不误判为缺口；跨档位边界的沿用单独标记。</li>
+          <li><strong>发布状态：</strong>对齐按分段作业发布，全部分段完成后原子切换 active；
+            中断续跑只重放未完成分段，失败保留旧版。</li>
           <li><strong>时钟：</strong>共 {{ report.summary.drifted_pairs }} 个序列判定为时钟漂移；
             LINE-A-03 的偏移量与「现场 +37 秒」的结论一致，其余设备偏移在阈值之内。</li>
         </ul>
@@ -192,8 +262,9 @@
         <details class="help" style="margin-top:10px">
           <summary>CSV 列与导出说明</summary>
           <div class="small" style="margin-top:6px">
-            CSV 列：device_id, metric, interval_s, expected_cells, raw_cells, carried_cells, interpolated_cells,
-            unrepaired_cells, valid_cells, coverage, grade, gap_count, offset_s, rate_ppm, rmse_s, drifted。
+            质量 CSV 在原列基础上新增 segment_count（档位分段数）、segment_intervals（各档间隔）、
+            publish_status（发布状态）、cross_segment_cells（跨档位沿用格）；
+            另有「分段 CSV」每个采样档位一行，含桶区间、段覆盖率与可观测能力解释。
             <div style="margin-top:6px">导出的是当前数据集 + 当前阈值的全量结果；按阈值重新计算会得到不同的分级。</div>
           </div>
         </details>

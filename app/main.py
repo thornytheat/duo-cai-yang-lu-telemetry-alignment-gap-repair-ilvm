@@ -8,7 +8,7 @@ from fastapi.responses import HTMLResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
-from . import pipeline, quality, seed, settings, store
+from . import pipeline, publication, quality, seed, settings, store
 
 BASE = pathlib.Path(__file__).resolve().parent
 templates = Jinja2Templates(directory=str(BASE / "templates"))
@@ -80,6 +80,10 @@ def index(request: Request):
         "total_gaps": summary["total_gaps"],
         "drifted_pairs": summary["drifted_pairs"],
         "run_count": len(store.list_runs(limit=200)),
+        "published_count": len([
+            p for p in store.list_publications(dataset.dataset_id) if p["status"] == "published" and p["is_active"]
+        ]),
+        "multi_segment_pairs": sum(1 for r in report["rows"] if r["coverage"].get("segment_count", 0) > 1),
     }
     last_run = store.get_run(runs[0]["run_id"]) if runs else None
     return templates.TemplateResponse(
@@ -195,6 +199,14 @@ def _report(dataset, threshold: float) -> dict:
     cached = STATE["report_cache"].get(key)
     if cached is None:
         cached = pipeline.build_report(dataset, threshold)
+        # 发布状态来自发布表（active 版本），与计算结果解耦：页面/导出可核对发布状态。
+        for row in cached["rows"]:
+            pub = store.get_active_publication(dataset.dataset_id, row["device_id"], row["metric"])
+            row["publish_status"] = pub["status"] if pub else "unpublished"
+            row["pub_id"] = pub["pub_id"] if pub else None
+            row["is_active"] = bool(pub and pub["is_active"])
+        cached["csv"] = quality.report_csv(cached["rows"])
+        cached["segments_csv"] = quality.segment_csv(cached["rows"])
         STATE["report_cache"][key] = cached
     return cached
 
@@ -259,15 +271,19 @@ async def api_align(request: Request):
         )
     threshold = _parse_threshold(body.get("offset_threshold"))
 
+    # 走分段发布器：按档位分段作业执行，已发布版本幂等复用，全部分段完成后原子切换。
     try:
-        payload = pipeline.run_alignment(dataset, device_id, metric, threshold)
+        pub = publication.run_publication(dataset, device_id, metric, threshold)
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=422, detail=f"对齐失败：{exc}") from exc
 
+    payload = dict(pub["payload"])
+    # 历史 run 记录继续保留（结果页/最近对齐表沿用），与发布版本解耦。
     run_id = store.save_run(dataset.dataset_id, payload)
-    payload_out = dict(payload)
-    payload_out["run_id"] = run_id
-    return payload_out
+    payload["run_id"] = run_id
+    payload["pub_id"] = pub["pub_id"]
+    payload["publish_status"] = pub["status"]
+    return payload
 
 
 @app.get("/api/runs/{run_id}")
@@ -276,6 +292,54 @@ def api_run(run_id: str):
     if payload is None:
         raise HTTPException(status_code=404, detail=f"运行 {run_id} 不存在")
     return payload
+
+
+@app.get("/api/publications")
+def api_publications():
+    """全部发布版本：可核对每条序列的档位分段数、发布状态与 active 指针。"""
+    dataset = get_dataset()
+    pubs = store.list_publications(dataset.dataset_id)
+    return {
+        "dataset_id": dataset.dataset_id,
+        "publications": [
+            {
+                "pub_id": p["pub_id"],
+                "device_id": p["device_id"],
+                "metric": p["metric"],
+                "threshold_s": p["threshold_s"],
+                "status": p["status"],
+                "is_active": p["is_active"],
+                "segment_count": p["segment_count"],
+                "error": p["error"],
+                "created_at": p["created_at"],
+                "updated_at": p["updated_at"],
+            }
+            for p in pubs
+        ],
+    }
+
+
+@app.get("/api/publications/{pub_id}")
+def api_publication_detail(pub_id: str):
+    """单个发布版本详情：含每个分段作业的状态/尝试次数与分段结果切片。"""
+    pub = store.get_publication(pub_id)
+    if pub is None:
+        raise HTTPException(status_code=404, detail=f"发布版本 {pub_id} 不存在")
+    jobs = store.list_segment_jobs(pub_id)
+    return {
+        "publication": {k: v for k, v in pub.items() if k != "payload"},
+        "segment_jobs": [
+            {
+                "segment_index": j["segment_index"],
+                "interval_s": j["interval_s"],
+                "status": j["status"],
+                "attempts": j["attempts"],
+                "error": j["error"],
+            }
+            for j in jobs
+        ],
+        "payload": pub["payload"],
+    }
 
 
 @app.get("/api/report")
@@ -293,6 +357,10 @@ def api_report(threshold: float | None = None):
                 "metric": row["metric"],
                 "interval_s": row["interval_s"],
                 "coverage": row["coverage"],
+                "segments": row.get("segments", []),
+                "publish_status": row.get("publish_status"),
+                "pub_id": row.get("pub_id"),
+                "is_active": row.get("is_active"),
                 "drift": {
                     "available": row["drift"].get("available"),
                     "offset_s": row["drift"].get("offset_s"),
@@ -315,6 +383,20 @@ def api_report_csv(threshold: float | None = None):
         report["csv"],
         media_type="text/csv; charset=utf-8",
         headers={"Content-Disposition": f'attachment; filename="tsgrid-quality-{dataset.dataset_id}.csv"'},
+    )
+
+
+@app.get("/api/report.segments.csv", response_class=PlainTextResponse)
+def api_report_segments_csv(threshold: float | None = None):
+    """分段明细导出：每行一个采样档位分段，含桶区间、覆盖与可观测能力解释。"""
+    dataset = get_dataset()
+    report = _report(dataset, _parse_threshold(threshold))
+    return PlainTextResponse(
+        report["segments_csv"],
+        media_type="text/csv; charset=utf-8",
+        headers={
+            "Content-Disposition": f'attachment; filename="tsgrid-segments-{dataset.dataset_id}.csv"'
+        },
     )
 
 

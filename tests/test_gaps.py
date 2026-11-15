@@ -108,3 +108,31 @@ def test_hold_filled_cells_are_not_reported_as_gap():
     result = gaps.find_gaps(cells)
     assert result["count"] == 0
     assert result["interpolated_cells"] == 0
+
+
+def test_interpolation_does_not_cross_segment_boundary():
+    # 高频 1s 段（桶 0-1）切到可持续的低频 60s 段（桶 7-10），中间桶 2-6 共 5 格空缺，
+    # 超过 hold 上限（3 格）。缺口必须按分段登记为边界未修复，绝不跨档位插值。
+    points = [(B0 * 60 + float(i), 10.0) for i in range(120)]             # 桶 0、1 为 1s 高频
+    points += [(B0 * 60 + 420 + 5 + k * 60, 30.0 + k) for k in range(4)]  # 桶 7..10 为 60s 低频
+    cells = grid.resample(points, interval_s=1, start_bucket=B0, end_bucket=B0 + 10)
+    seg_ids = {c["segment_index"] for c in cells}
+    assert len(seg_ids) == 2
+    result = gaps.find_gaps(cells)
+    # 跨档位的长空缺只能是 unrepaired，绝不允许 interpolated（插补不跨分段）
+    assert result["interpolated_cells"] == 0
+    assert result["unrepaired_cells"] >= 5
+    assert all(g["kind"] == "unrepaired" for g in result["items"])
+    # 没有任何格子被跨段插值
+    assert all(c["source"] != "interpolated" for c in cells)
+
+
+def test_short_boundary_gap_is_held_with_cross_segment_flag():
+    # 1s 段后仅 2 个空桶即进入可持续 60s 段，间距在 hold 上限内：跨档沿用并显式标记
+    points = [(B0 * 60 + float(i), 10.0) for i in range(120)]   # 桶 0、1
+    points += [(B0 * 60 + 180 + 5 + k * 60, 20.0 + k) for k in range(4)]  # 桶 3..6（桶 2 空缺）
+    cells = grid.resample(points, interval_s=1, start_bucket=B0, end_bucket=B0 + 6)
+    result = gaps.find_gaps(cells)
+    held = [c for c in cells if c.get("cross_segment")]
+    assert held and all(c["carried"] for c in held)
+    assert result["count"] == 0  # 跨档 hold 不算缺口

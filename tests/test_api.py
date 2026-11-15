@@ -33,8 +33,10 @@ def test_import_is_idempotent(client: TestClient):
     assert first["dataset_id"] == second["dataset_id"]
     assert first["sha256"] == second["sha256"]
     assert first["rows"] > 20000
-    assert len(first["devices"]) == 3
-    assert {d["device_id"] for d in first["devices"]} == {"LINE-A-01", "LINE-A-02", "LINE-A-03"}
+    assert len(first["devices"]) == 4
+    assert {d["device_id"] for d in first["devices"]} == {
+        "LINE-A-01", "LINE-A-02", "LINE-A-03", "LINE-A-04"
+    }
     assert first["window"]["cells"] == 360
 
 
@@ -46,6 +48,7 @@ def test_drifted_device_offset_is_about_37_seconds(client: TestClient):
     assert abs(data["drift"]["offset_s"] - 37.0) < 1.0
     assert data["drift"]["drifted"] is True
     assert data["drift"]["rmse_s"] < 1.0
+    # LINE-A-01 与 LINE-A-04 最高档都是 1s，设备号序 tie-break 取 LINE-A-01
     assert data["reference"]["device_id"] == "LINE-A-01"
     # 温度序列：3 格插补缺口 + 5 格未修复缺口 = 2 处
     assert data["gaps"]["count"] == 2
@@ -133,10 +136,10 @@ def test_pages_render(client: TestClient):
 
 def test_report_and_csv_export(client: TestClient):
     report = client.get("/api/report").json()
-    assert len(report["rows"]) == 5
+    assert len(report["rows"]) == 6
     grades = {row["coverage"]["grade"] for row in report["rows"]}
     assert grades == {"A", "B", "C"}
-    assert len(report["devices"]) == 3
+    assert len(report["devices"]) == 4
     assert report["summary"]["total_gaps"] >= 5
 
     csv_resp = client.get("/api/report.csv")
@@ -144,7 +147,37 @@ def test_report_and_csv_export(client: TestClient):
     assert csv_resp.headers["content-type"].startswith("text/csv")
     lines = [line for line in csv_resp.text.strip().splitlines() if line]
     assert lines[0].startswith("device_id,metric,interval_s")
-    assert len(lines) == 6  # 表头 + 5 条序列
+    assert len(lines) == 7  # 表头 + 6 条序列
+    assert "segment_count" in lines[0] and "publish_status" in lines[0]
+
+    # 分段明细 CSV：每个采样档位分段一行
+    seg_resp = client.get("/api/report.segments.csv")
+    assert seg_resp.status_code == 200
+    seg_lines = [line for line in seg_resp.text.strip().splitlines() if line]
+    assert "observability" in seg_lines[0]
+    assert len(seg_lines) > 7  # 至少每个序列一个分段
+
+
+def test_publication_endpoints_report_status_and_jobs(client: TestClient):
+    # 触发一条多档位序列的发布（LINE-A-04 有 5 个档位分段）
+    align(client, device_id="LINE-A-04", metric="temperature")
+    pubs = client.get("/api/publications").json()["publications"]
+    target = [p for p in pubs if p["device_id"] == "LINE-A-04"]
+    assert target and target[0]["status"] == "published"
+    assert target[0]["is_active"] is True
+    assert target[0]["segment_count"] == 5
+
+    detail = client.get(f"/api/publications/{target[0]['pub_id']}").json()
+    jobs = detail["segment_jobs"]
+    assert len(jobs) == 5
+    assert all(j["status"] == "done" for j in jobs)
+    assert detail["payload"]["segments"]
+
+    # 对齐响应带发布信息
+    data = align(client, device_id="LINE-A-04", metric="temperature").json()
+    assert data["pub_id"] == target[0]["pub_id"]
+    assert data["publish_status"] == "published"
+    assert data["coverage"]["segment_count"] == 5
 
 
 def test_alignment_pipeline_stages_recorded(client: TestClient):

@@ -17,6 +17,10 @@ DEFAULT_OFFSET_THRESHOLD_S = 5.0
 HOLD_MAX_BRACKET_BUCKETS = 3   # 前后原始格间距 <= 3 格 -> 视为低频采样段，hold 沿用（carried）
 INTERPOLATE_MAX_CELLS = 3      # 缺口 <= 3 格 -> 线性插补；> 3 格 -> unrepaired
 
+# 连续采样档位分段：短于该跨度且点数不足的游程（短暂补传/个别稀疏点）并入邻段，不单独成段
+SEGMENT_MIN_SPAN_S = 60.0      # 游程持续 < 60s（不足 1 个分钟桶）视为短暂突发
+SEGMENT_MIN_POINTS = 3         # 且点数 < 3 个 —— 两个条件同时满足才吸收
+
 # 质量分级
 GRADE_A_COVERAGE = 0.98
 GRADE_B_COVERAGE = 0.95
